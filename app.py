@@ -50,6 +50,27 @@ POST /api/preview-row    单行针位预览（不展开重复项，可直接看�
   失败: {"ok": false, "error": {"type": "sizes"|"line"|"start"|"size_index"
          |"parse", ...}}
 
+POST /api/track-stitch   跨行针位追踪（不展开重复项）
+  请求: {"sizes": [...], "pattern": "...", "size_index": 0,
+         "needle": 1}
+    needle 为第 1 行开始前所选尺码起针中的一枚针序号（1 起）。复用同一套
+    解析与逐行校验规则：逐行解析（嵌套重复与 *{...} 按所选尺码算术定位），
+    仅在该行消耗恰好等于当前可用针数时继续，定位这枚针被哪个针法消耗、
+    该操作的入针范围与产出针位，并以产出针位作为下一行的入针序号；
+    k2tog 标出与之合并的相邻针，yo 不消耗入针、只把之后的产出位置推后。
+  成功: {"ok": true, "size", "size_index", "cast_on", "needle",
+         "tracks": [{"line", "instruction", "in", "needle_in",
+                     "stitch", "in_from", "in_to", "merged_with",
+                     "yos_before", "seq", "out_needle",
+                     "consume", "produce", "available_out"}, ...],
+         "final_needle"}
+    tracks 按原文行号只列有效行（空行计入行号但不列出）；针数不符或指令
+    非法时停在首个错误行，tracks 保留此前轨迹，error 给出原文行号
+    （解析错误另带字符位置 char）。
+  失败: {"ok": false, "error": {"type": "sizes"|"size_index"|"needle"
+         |"parse"|"count", ...}, "tracks"?: [...]}
+    needle 超出所选尺码起针数时 type 为 "needle"（在解析任何行之前报错）。
+
 逐行推算规则：每个尺码独立地以上一行的产出作为下一行的可用针数；某尺码
 消耗与可用针数不一致（不足或超出）时，仅该尺码停止并记录行号与差额，
 其余尺码继续推算。指令本身无法解析（含 *{a|b} 项数与尺码数不符、倍数
@@ -80,6 +101,8 @@ from stitch_parser import (
     STITCH_NAMES,
     ParseError,
     PreviewStartError,
+    StitchOutOfRangeError,
+    locate_row_input,
     parse_row,
     parse_row_details,
     preview_row_stitches,
@@ -559,6 +582,132 @@ def preview_row():
         "prev_start": preview["prev_start"],
         "next_start": preview["next_start"],
     })
+
+
+@app.post("/api/track-stitch")
+def track_stitch():
+    """跨行针位追踪：按尺码与一枚起针序号，逐行列出它被哪种针法消耗。
+
+    复用与 /api/validate-sizes 完全相同的解析与逐行校验规则：每行先按所选
+    尺码解析（嵌套重复与 *{...} 由 stitch_parser 算术定位、绝不展开），只有
+    该行消耗恰好等于当前可用针数时才把该枚针定位到具体针法，并把其产出针位
+    作为下一行的入针序号。针数不符（type 为 count）或任一行语法错误（type
+    为 parse，带 char）时停在首个错误行，tracks 保留此前各有效行轨迹。
+    """
+    data = request.get_json(silent=True) or {}
+
+    sizes, err = _parse_sizes(data.get("sizes"))
+    if err:
+        return jsonify({
+            "ok": False,
+            "error": {"line": None, "type": "sizes", "message": err},
+        })
+
+    num_sizes = len(sizes)
+    size_index = data.get("size_index", 0)
+    if isinstance(size_index, bool) or not isinstance(size_index, int) \
+            or not (0 <= size_index < num_sizes):
+        return jsonify({
+            "ok": False,
+            "error": {"line": None, "type": "size_index",
+                      "message": "尺码下标必须在 0~{} 之间".format(num_sizes - 1)},
+        })
+
+    needle, err = _parse_cast_on(data.get("needle"))
+    if err:
+        return jsonify({
+            "ok": False,
+            "error": {"line": None, "type": "needle",
+                      "message": "起针序号必须为正整数"},
+        })
+
+    size = sizes[size_index]
+    cast_on = size["cast_on"]
+    if needle > cast_on:
+        return jsonify({
+            "ok": False,
+            "error": {
+                "line": None,
+                "type": "needle",
+                "cast_on": cast_on,
+                "needle": needle,
+                "message": "起针序号越界：尺码 {} 起针 {} 针，序号必须在 1~{} 之间".format(
+                    size["name"], cast_on, cast_on),
+            },
+        })
+
+    pattern = data.get("pattern", "")
+    if not isinstance(pattern, str):
+        pattern = str(pattern)
+
+    tracks = []
+    error = None
+    available = cast_on   # 当前行开始前的可用（入针）针数
+    current = needle      # 被追踪的针在当前入针序列中的序号
+    for lineno, raw_line in enumerate(pattern.splitlines(), 1):
+        text = raw_line.strip()
+        if not text:  # 空行计入行号但不是有效行，跳过且不消耗针
+            continue
+        try:
+            located = locate_row_input(text, num_sizes, size_index, current)
+        except ParseError as exc:
+            # 与校验接口完全一致的语法错误对象（同一原文行号与字符位置）
+            error = _parse_error_obj(lineno, text, exc)
+            break
+        except StitchOutOfRangeError as exc:
+            # 理论上只在“消耗 < 可用”时发生（current 落在未使用针上）；
+            # “消耗 > 可用”会先在下面的针数校验处停止。统一按针数差额报错。
+            error = _count_error_obj(lineno, text, available, exc.consume)
+            break
+        consume = located["consume"]
+        produce = located["produce"]
+        if consume != available:
+            error = _count_error_obj(lineno, text, available, consume)
+            break
+        stitch = located["stitch"]
+        in_from = located["in_from"]
+        in_to = located["in_to"]
+        # 每个针法（含 yo）恰好产出 1 针，产出按操作先后编号，故出针序号
+        # 等于该针法在整行实际针法序列中的操作序号（与单行预览一致）；
+        # yo 不消耗入针，却占一个出针序号，因而会把之后的产出位置推后。
+        out_needle = located["seq"]
+        # k2tog 与相邻针合并：标明被并入的另一枚针（追踪的可能是范围任一端）；
+        # k/p 无合并，为 None
+        if stitch == "k2tog":
+            merged_with = in_to if current == in_from else in_from
+        else:
+            merged_with = None
+        tracks.append({
+            "line": lineno,
+            "instruction": text,
+            "in": available,
+            "needle_in": current,
+            "stitch": stitch,
+            "in_from": in_from,
+            "in_to": in_to,
+            "merged_with": merged_with,
+            "yos_before": located["yos_before"],
+            "seq": located["seq"],
+            "out_needle": out_needle,
+            "consume": consume,
+            "produce": produce,
+            "available_out": produce,
+        })
+        current = out_needle
+        available = produce
+
+    result = {
+        "ok": error is None,
+        "size": size["name"],
+        "size_index": size_index,
+        "cast_on": cast_on,
+        "needle": needle,
+        "tracks": tracks,
+        "error": error,
+    }
+    if error is None:
+        result["final_needle"] = current
+    return jsonify(result)
 
 
 def _yarn_summary(yarn, state):

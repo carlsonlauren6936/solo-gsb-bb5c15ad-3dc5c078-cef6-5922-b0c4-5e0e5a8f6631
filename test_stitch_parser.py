@@ -4,6 +4,8 @@ from stitch_parser import (
     PREVIEW_PAGE_SIZE,
     ParseError,
     PreviewStartError,
+    StitchOutOfRangeError,
+    locate_row_input,
     parse_row,
     parse_row_details,
     parse_row_nodes,
@@ -588,6 +590,157 @@ class TestPreviewRowStitches(unittest.TestCase):
         self.assertEqual((c, p), ([14, 15], [17, 18]))
         self.assertEqual(len(nodes), 2)
         self.assertEqual(tallies['k'], [8, 9])
+
+
+class TestLocateRowInput(unittest.TestCase):
+    """跨行追踪的“按入针序号定位”单测。"""
+
+    def _brute(self, text, num_sizes, size_index):
+        """逐个展开针法，模拟入针消耗，返回 {入针序号: 定位结果期望}。"""
+        names = _expand_row(text, num_sizes, size_index)
+        consumed = 0
+        expected = {}
+        yos = 0
+        for seq, name in enumerate(names, 1):
+            c = {'k': 1, 'p': 1, 'yo': 0, 'k2tog': 2}[name]
+            if c:
+                for pos in range(consumed + 1, consumed + c + 1):
+                    expected[pos] = {
+                        'stitch': name,
+                        'in_from': consumed + 1,
+                        'in_to': consumed + c,
+                        'seq': seq,
+                        'yos_before': yos,
+                        'consume': sum(
+                            {'k': 1, 'p': 1, 'yo': 0, 'k2tog': 2}[s]
+                            for s in names),
+                        'produce': len(names),
+                    }
+            if name == 'yo':
+                yos += 1
+            consumed += c
+        return expected
+
+    def test_basic_row(self):
+        expected = self._brute('k p yo k2tog', 1, 0)
+        self.assertEqual(locate_row_input('k p yo k2tog', 1, 0, 1)['stitch'], 'k')
+        self.assertEqual(locate_row_input('k p yo k2tog', 1, 0, 2)['stitch'], 'p')
+        hit = locate_row_input('k p yo k2tog', 1, 0, 3)
+        self.assertEqual(
+            (hit['stitch'], hit['in_from'], hit['in_to'], hit['seq']),
+            ('k2tog', 3, 4, 4))
+        hit = locate_row_input('k p yo k2tog', 1, 0, 4)
+        self.assertEqual((hit['stitch'], hit['seq'], hit['in_from']),
+                         ('k2tog', 4, 3))
+        # yo 占操作序号但不消耗入针：k2tog 的操作序号是 4、yos_before 为 1
+        self.assertEqual(hit['yos_before'], 1)
+        for pos, exp in expected.items():
+            got = locate_row_input('k p yo k2tog', 1, 0, pos)
+            self.assertEqual(got, exp, msg=pos)
+
+    def test_repeat_group(self):
+        text = '(k2tog yo)*2'
+        expected = self._brute(text, 1, 0)
+        for pos, exp in expected.items():
+            self.assertEqual(locate_row_input(text, 1, 0, pos), exp, msg=pos)
+
+    def test_nested_repeats(self):
+        text = '((k yo)*2 k2tog)*3'
+        expected = self._brute(text, 1, 0)
+        for pos, exp in expected.items():
+            self.assertEqual(locate_row_input(text, 1, 0, pos), exp, msg=pos)
+
+    def test_size_multipliers_resolved_per_size(self):
+        text = '(k2tog yo)*{6|8|10}'
+        for size_index, consume in enumerate([12, 16, 20]):
+            for pos in (1, 2, consume - 1, consume):
+                got = locate_row_input(text, 3, size_index, pos)
+                exp = self._brute(text, 3, size_index)[pos]
+                self.assertEqual(got, exp, msg=(size_index, pos))
+        # L 尺码尾枚针：最后一组 k2tog 消耗 19-20，操作序号 19（其前有 9 个 yo）
+        got = locate_row_input(text, 3, 2, 20)
+        self.assertEqual(
+            (got['stitch'], got['in_from'], got['in_to'], got['seq'],
+             got['yos_before']),
+            ('k2tog', 19, 20, 19, 9))
+
+    def test_nested_size_multiplier(self):
+        text = '(k*{2|3} yo)*2'
+        expected = self._brute(text, 2, 1)
+        for pos, exp in expected.items():
+            self.assertEqual(locate_row_input(text, 2, 1, pos), exp, msg=pos)
+
+    def test_yo_only_and_leading_yo_runs(self):
+        # (yo)*3 k2tog：挂线不消耗；k2tog 消耗 1-2，操作序号 4，其前有 3 个 yo
+        got = locate_row_input('(yo)*3 k2tog', 1, 0, 2)
+        self.assertEqual(
+            (got['stitch'], got['in_from'], got['in_to'], got['seq'],
+             got['yos_before'], got['consume'], got['produce']),
+            ('k2tog', 1, 2, 4, 3, 2, 4))
+        got = locate_row_input('(yo k)*2', 1, 0, 1)
+        self.assertEqual(
+            (got['stitch'], got['seq'], got['yos_before'], got['in_from']),
+            ('k', 2, 1, 1))
+        got = locate_row_input('(yo k)*2', 1, 0, 2)
+        self.assertEqual(
+            (got['stitch'], got['seq'], got['yos_before'], got['in_from']),
+            ('k', 4, 2, 2))
+
+    def test_zero_consume_repeats_inside_group(self):
+        text = '((yo)*2 k2tog)*4 p*2'
+        expected = self._brute(text, 1, 0)
+        for pos, exp in expected.items():
+            self.assertEqual(locate_row_input(text, 1, 0, pos), exp, msg=pos)
+
+    def test_huge_repeats_not_expanded(self):
+        # (k yo)*1e9：入针总数 1e9，直接定位尾枚
+        got = locate_row_input('(k yo)*1000000000', 1, 0, 1000000000)
+        self.assertEqual(
+            (got['stitch'], got['in_from'], got['seq'], got['yos_before'],
+             got['consume'], got['produce']),
+            ('k', 1000000000, 1999999999, 999999999,
+             1000000000, 2000000000))
+
+    def test_huge_nested_zero_consume(self):
+        # (yo)*1e9 k2tog：不展开 yo 段
+        got = locate_row_input('(yo)*1000000000 k2tog', 1, 0, 1)
+        self.assertEqual(
+            (got['stitch'], got['seq'], got['yos_before'], got['in_to']),
+            ('k2tog', 1000000001, 1000000000, 2))
+
+    def test_deep_nested_huge(self):
+        # (((k yo)*1e6)*1e6)：入针总数 1e12，尾枚入针属于最后一个 k
+        got = locate_row_input(
+            '(((k yo)*1000000)*1000000)', 1, 0, 1000000000000)
+        self.assertEqual(
+            (got['stitch'], got['in_from'], got['seq'], got['yos_before']),
+            ('k', 1000000000000, 1999999999999, 999999999999))
+
+    def test_out_of_range_raises(self):
+        with self.assertRaises(StitchOutOfRangeError) as ctx:
+            locate_row_input('k*3', 1, 0, 4)
+        self.assertEqual(ctx.exception.consume, 3)
+        with self.assertRaises(StitchOutOfRangeError):
+            locate_row_input('(yo)*3', 1, 0, 1)  # 整行不消耗入针
+
+    def test_invalid_arguments(self):
+        for bad in [0, -1, '1', 1.0, True, None]:
+            with self.assertRaises(ValueError, msg=repr(bad)):
+                locate_row_input('k', 1, 0, bad)
+        for bad in [-1, 2, 3, '0', 0.0, True]:
+            with self.assertRaises(ValueError, msg=repr(bad)):
+                locate_row_input('k*{1|2}', 2, bad, 1)
+
+    def test_parse_error_same_position(self):
+        for bad in ['ssk', '(k yo', 'k)', '()', 'k*0', 'k*{1}']:
+            with self.assertRaises(ParseError, msg=bad) as ctx_locate:
+                locate_row_input(bad, 2, 0, 1)
+            with self.assertRaises(ParseError) as ctx_parse:
+                parse_row_details(bad, 2)
+            self.assertEqual(str(ctx_locate.exception),
+                             str(ctx_parse.exception), msg=bad)
+            self.assertEqual(ctx_locate.exception.pos,
+                             ctx_parse.exception.pos, msg=bad)
 
 
 if __name__ == '__main__':

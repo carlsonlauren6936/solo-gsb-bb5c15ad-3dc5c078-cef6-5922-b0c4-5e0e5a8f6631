@@ -39,6 +39,12 @@
       可前后翻页、直接跳到首尾）；<code>yo</code> 等零入针针法会标明插入位置。重复段不展开，
       十亿次重复也能直接查看尾段。
     </p>
+    <p class="hint">
+      “跨行针位追踪”选择一个尺码与一枚起针序号后，按原文行号逐行列出这枚针在每个有效行
+      被哪种针法消耗、该操作的入针范围与产出针位：<code>k2tog</code> 会标明与相邻的哪一枚针
+      合并，<code>yo</code> 不消耗入针、只会把之后的产出位置推后。针数不符或语法错误时停在
+      首个错误行，此前轨迹保留并给出原文行号与字符位置。
+    </p>
 
     <form id="check-form">
       <div class="field">
@@ -142,6 +148,48 @@
               <th>消耗入针</th>
               <th>插入位置</th>
               <th>产出出针</th>
+            </tr>
+          </thead>
+          <tbody></tbody>
+        </table>
+      </div>
+    </section>
+
+    <section class="preview-section" id="track-section">
+      <h2>跨行针位追踪</h2>
+      <p class="hint">
+        选择一个尺码与该尺码起针中的一枚针序号（1 起），点“追踪”：按原文行号逐行列出这枚针
+        在每个有效行被哪种针法消耗、该操作的入针范围、与相邻针的合并及产出的针位。嵌套重复与
+        <code>*{a|b|c}</code> 按所选尺码算术定位，不展开重复项；起针序号越界明确报错，针数
+        不符或语法错误时停在首个错误行（语法错误给出字符位置），此前轨迹保留。
+      </p>
+      <div class="preview-controls">
+        <label class="preview-item">
+          <span>尺码</span>
+          <select id="track-size" size="4"></select>
+        </label>
+        <label class="preview-item">
+          <span>起针序号</span>
+          <input type="number" id="track-needle" min="1" step="1" value="1">
+        </label>
+        <div class="preview-actions">
+          <button type="button" id="track-go">追踪</button>
+        </div>
+      </div>
+      <div id="track-message" class="move-message" hidden></div>
+      <div id="track-result" hidden>
+        <div id="track-meta" class="preview-meta"></div>
+        <table id="track-table">
+          <thead>
+            <tr>
+              <th>原文行号</th>
+              <th>指令</th>
+              <th>本行入针序号</th>
+              <th>针法</th>
+              <th>该操作入针范围</th>
+              <th>合并相邻针</th>
+              <th>此前 yo</th>
+              <th>产出针位（下一行入针）</th>
             </tr>
           </thead>
           <tbody></tbody>

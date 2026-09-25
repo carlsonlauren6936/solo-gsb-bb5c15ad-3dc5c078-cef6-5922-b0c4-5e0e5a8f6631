@@ -786,5 +786,241 @@ class TestPreviewRowApi(unittest.TestCase):
                          ['k', 'yo', 'k', 'yo', 'k'])
 
 
+class TestTrackStitchApi(unittest.TestCase):
+    SIZES = [{'name': 'S', 'cast_on': 12},
+             {'name': 'M', 'cast_on': 16},
+             {'name': 'L', 'cast_on': 20}]
+    PATTERN = '\n'.join([
+        '(k2tog yo)*{6|8|10}',
+        'p*{12|16|20}',
+        '(k2tog)*{6|8|10}',
+        '(k2tog)*{3|4|5}',
+        'k*{3|4|5}',
+    ])
+
+    def setUp(self):
+        self.client = app.test_client()
+
+    def track(self, needle, size_index=0, sizes=None, pattern=None):
+        return self.client.post('/api/track-stitch', json={
+            'sizes': sizes or self.SIZES,
+            'pattern': self.PATTERN if pattern is None else pattern,
+            'size_index': size_index,
+            'needle': needle,
+        }).get_json()
+
+    def test_tracks_every_valid_row_with_line_numbers(self):
+        data = self.track(1)
+        self.assertTrue(data['ok'])
+        self.assertEqual(data['size'], 'S')
+        self.assertEqual(data['cast_on'], 12)
+        self.assertEqual(data['needle'], 1)
+        self.assertEqual(data['final_needle'], 1)
+        self.assertIsNone(data['error'])
+        self.assertEqual([t['line'] for t in data['tracks']], [1, 2, 3, 4, 5])
+        first = data['tracks'][0]
+        self.assertEqual(first, {
+            'line': 1,
+            'instruction': '(k2tog yo)*{6|8|10}',
+            'in': 12,
+            'needle_in': 1,
+            'stitch': 'k2tog',
+            'in_from': 1,
+            'in_to': 2,
+            'merged_with': 2,
+            'yos_before': 0,
+            'seq': 1,
+            'out_needle': 1,
+            'consume': 12,
+            'produce': 12,
+            'available_out': 12,
+        })
+
+    def test_needle_chains_across_rows(self):
+        # 第 12 枚针：行1 与第 11 枚合并产出第 11 针；之后随 k2tog 逐级合并
+        data = self.track(12)
+        chain = [(t['line'], t['needle_in'], t['stitch'],
+                  t['in_from'], t['in_to'], t['merged_with'],
+                  t['out_needle']) for t in data['tracks']]
+        self.assertEqual(chain, [
+            (1, 12, 'k2tog', 11, 12, 11, 11),
+            (2, 11, 'p', 11, 11, None, 11),
+            (3, 11, 'k2tog', 11, 12, 12, 6),
+            (4, 6, 'k2tog', 5, 6, 5, 3),
+            (5, 3, 'k', 3, 3, None, 3),
+        ])
+        self.assertEqual(data['final_needle'], 3)
+
+    def test_size_index_selects_multiplier(self):
+        # L 尺码第 19 枚针
+        data = self.track(19, size_index=2)
+        self.assertTrue(data['ok'])
+        self.assertEqual(data['size'], 'L')
+        self.assertEqual(
+            [(t['needle_in'], t['stitch'], t['in_from'], t['in_to'])
+             for t in data['tracks']],
+            [(19, 'k2tog', 19, 20), (19, 'p', 19, 19),
+             (19, 'k2tog', 19, 20), (10, 'k2tog', 9, 10),
+             (5, 'k', 5, 5)])
+
+    def test_k_and_p_have_no_merge(self):
+        # 两行都平衡：行1 k p k p（4->4），行2 p k2tog k（4->3）；
+        # 追踪第 1 枚针：行1 被 k 消耗、行2 被 p 消耗，均无合并
+        data = self.track(1, sizes=[{'name': 'S', 'cast_on': 4}],
+                         pattern='k p k p\np k2tog k')
+        self.assertTrue(data['ok'])
+        self.assertEqual(len(data['tracks']), 2)
+        self.assertTrue(all(t['merged_with'] is None for t in data['tracks']))
+        self.assertEqual([t['stitch'] for t in data['tracks']], ['k', 'p'])
+        self.assertEqual([t['out_needle'] for t in data['tracks']], [1, 1])
+
+    def test_yo_only_shifts_later_output_positions(self):
+        # 行1 k2tog yo：两枚入针合并产出第 1 针，yo 产出第 2 针（不消耗入针）；
+        # 行2 p p：追踪第 2 枚入针，行1 合并后是第 1 针，故行2 被第 1 个 p 消耗
+        data = self.track(2, sizes=[{'name': 'S', 'cast_on': 2}],
+                         pattern='k2tog yo\np p')
+        self.assertTrue(data['ok'])
+        r1, r2 = data['tracks']
+        self.assertEqual(r1['stitch'], 'k2tog')
+        self.assertEqual(r1['merged_with'], 1)
+        self.assertEqual(r1['out_needle'], 1)
+        self.assertEqual(r2['needle_in'], 1)
+        self.assertEqual((r2['stitch'], r2['in_from'], r2['in_to'],
+                          r2['out_needle']), ('p', 1, 1, 1))
+        self.assertEqual(data['final_needle'], 1)
+
+    def test_needle_through_yo_position_shift(self):
+        # 第 1 枚针穿过 'yo k' 行：yo 不消耗，k 消耗第 1 枚但产出在第 2 针位
+        data = self.track(1, sizes=[{'name': 'S', 'cast_on': 1}],
+                         pattern='yo k')
+        self.assertTrue(data['ok'])
+        t = data['tracks'][0]
+        self.assertEqual((t['stitch'], t['in_from'], t['seq'],
+                          t['yos_before'], t['out_needle']),
+                         ('k', 1, 2, 1, 2))
+        self.assertEqual(data['final_needle'], 2)
+
+    def test_nested_repeats_tracked_arithmetically(self):
+        # ((k yo)*2 k2tog)*3 消耗12产出15；起针12 平衡，追踪第 12 枚
+        data = self.track(12, sizes=[{'name': 'S', 'cast_on': 12}],
+                         pattern='((k yo)*2 k2tog)*3')
+        self.assertTrue(data['ok'])
+        t = data['tracks'][0]
+        self.assertEqual((t['stitch'], t['in_from'], t['in_to']),
+                         ('k2tog', 11, 12))
+
+    def test_needle_out_of_range_is_clear_error_before_rows(self):
+        data = self.track(13)
+        self.assertFalse(data['ok'])
+        self.assertEqual(data['error']['type'], 'needle')
+        self.assertEqual(data['error']['cast_on'], 12)
+        self.assertEqual(data['error']['needle'], 13)
+        self.assertNotIn('tracks', data)
+        self.assertIn('1~12', data['error']['message'])
+
+    def test_bad_needle_value(self):
+        for bad in [0, -3, 'x', 1.5, True, None, '']:
+            data = self.track(bad)
+            self.assertFalse(data['ok'], msg=repr(bad))
+            self.assertEqual(data['error']['type'], 'needle', msg=repr(bad))
+
+    def test_numeric_string_accepted(self):
+        data = self.track('12')
+        self.assertTrue(data['ok'])
+        self.assertEqual(data['needle'], 12)
+
+    def test_count_leftover_stops_and_keeps_prior_track(self):
+        data = self.track(12, sizes=[{'name': 'S', 'cast_on': 12}],
+                         pattern='k*12\nk*11')
+        self.assertFalse(data['ok'])
+        self.assertEqual(data['error']['type'], 'count')
+        self.assertEqual(data['error']['line'], 2)
+        self.assertEqual(data['error']['diff'], -1)
+        self.assertEqual([t['line'] for t in data['tracks']], [1])
+        self.assertNotIn('final_needle', data)
+
+    def test_count_shortfall_stops_at_first_bad_row(self):
+        data = self.track(1, sizes=[{'name': 'S', 'cast_on': 12}],
+                         pattern='k*12\nk2tog*7')
+        self.assertFalse(data['ok'])
+        self.assertEqual(data['error']['type'], 'count')
+        self.assertEqual(data['error']['line'], 2)
+        self.assertEqual(data['error']['diff'], 2)
+        self.assertEqual([t['line'] for t in data['tracks']], [1])
+
+    def test_parse_error_stops_with_line_and_char(self):
+        data = self.track(3, sizes=[{'name': 'S', 'cast_on': 4}],
+                         pattern='k*4\np*4\nssk')
+        self.assertFalse(data['ok'])
+        self.assertEqual(data['error']['type'], 'parse')
+        self.assertEqual(data['error']['line'], 3)
+        self.assertEqual(data['error']['char'], 1)
+        # 此前两行有效轨迹保留
+        self.assertEqual([t['line'] for t in data['tracks']], [1, 2])
+
+    def test_parse_error_consistent_with_validate_sizes(self):
+        pattern = '(k yo\nk*1'
+        track_data = self.track(1, sizes=[{'name': 'S', 'cast_on': 2}],
+                                pattern=pattern)
+        validate_data = self.client.post('/api/validate-sizes', json={
+            'sizes': [{'name': 'S', 'cast_on': 2}], 'pattern': pattern,
+        }).get_json()
+        verr = validate_data['sizes'][0]['error']
+        terr = track_data['error']
+        self.assertEqual(terr['type'], 'parse')
+        self.assertEqual((terr['line'], terr['char'], terr['message']),
+                         (verr['line'], verr['char'], verr['message']))
+
+    def test_size_brace_mismatch_is_parse_error_at_star(self):
+        data = self.track(1, pattern='k*{12|16}')
+        self.assertFalse(data['ok'])
+        self.assertEqual(data['error']['type'], 'parse')
+        self.assertEqual(data['error']['line'], 1)
+        self.assertEqual(data['error']['char'], 2)
+
+    def test_blank_lines_count_in_line_numbers(self):
+        data = self.track(4, sizes=[{'name': 'S', 'cast_on': 4}],
+                         pattern='k*4\n\np*4')
+        self.assertTrue(data['ok'])
+        self.assertEqual([t['line'] for t in data['tracks']], [1, 3])
+
+    def test_bad_size_index(self):
+        for bad in [3, -1, '0', 1.0, True, None]:
+            data = self.track(1, size_index=bad)
+            self.assertFalse(data['ok'], msg=repr(bad))
+            self.assertEqual(data['error']['type'], 'size_index',
+                             msg=repr(bad))
+
+    def test_bad_sizes_rejected(self):
+        for bad in [None, [], [{'name': '', 'cast_on': 4}],
+                    [{'name': 'S', 'cast_on': 0}],
+                    [{'name': 'S', 'cast_on': 'x'}]]:
+            data = self.client.post('/api/track-stitch', json={
+                'sizes': bad, 'pattern': 'k*4', 'size_index': 0,
+                'needle': 1,
+            }).get_json()
+            self.assertFalse(data['ok'], msg=repr(bad))
+            self.assertEqual(data['error']['type'], 'sizes', msg=repr(bad))
+
+    def test_size_index_defaults_to_zero(self):
+        data = self.client.post('/api/track-stitch', json={
+            'sizes': [{'name': 'S', 'cast_on': 4}], 'pattern': 'k*4',
+            'needle': 1,
+        }).get_json()
+        self.assertTrue(data['ok'])
+        self.assertEqual(data['size_index'], 0)
+
+    def test_huge_repeats_without_expansion(self):
+        # 十亿次重复直接定位，不能超时/展开
+        data = self.track(1000000000,
+                          sizes=[{'name': 'S', 'cast_on': 1000000000}],
+                          pattern='(k yo)*1000000000')
+        self.assertTrue(data['ok'])
+        t = data['tracks'][0]
+        self.assertEqual((t['stitch'], t['in_from'], t['out_needle']),
+                         ('k', 1000000000, 1999999999))
+        self.assertEqual(data['final_needle'], 1999999999)
+
+
 if __name__ == '__main__':
     unittest.main()

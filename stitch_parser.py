@@ -25,6 +25,12 @@ reorder_size_multipliers 在尺码顺序调整（上移/下移）时，按新顺
 中所有 *{a|b|...} 的倍数项：嵌套重复与同一行多处都会处理，普通 *n 与其他
 原文保持不变；任一处项数或数值不合法时抛 ParseError 并给出字符位置，调用
 方可据此中止整次移动。
+
+locate_row_input 为跨行针位追踪按入针序号定位：给定所选尺码与一枚入针序号
+（1 起），在不展开重复项的前提下算术定位实际消耗该针的针法，返回其入针
+范围、整行操作序号与此前 yo 数。定位同样先求每段消耗再用除法跳过完整副本，
+不展开十亿次重复；语法错误与 parse_row_details 同一 ParseError（同一字符
+位置），入针序号超出本行消耗时抛 StitchOutOfRangeError。
 """
 
 import re
@@ -75,6 +81,19 @@ class PreviewStartError(ValueError):
     def __init__(self, total):
         super().__init__("起始操作序号超出范围：本行共 {} 个实际针法".format(total))
         self.total = total
+
+
+class StitchOutOfRangeError(ValueError):
+    """跨行针位追踪：所追踪的入针序号超出该行实际消耗的针数。
+
+    consume 为该行（所选尺码下）消耗的入针总数；正常的逐行校验流程中
+    “消耗恰好等于可用针数”已先成立，故定位不会越界，此异常仅供直接调用
+    locate_row_input 的调用方使用。
+    """
+
+    def __init__(self, consume):
+        super().__init__("入针序号超出范围：本行只消耗 {} 针".format(consume))
+        self.consume = consume
 
 
 # 单行针位预览每页最多显示的实际针法数
@@ -535,7 +554,7 @@ class _View(object):
     """
 
     __slots__ = ('kind', 'name', 'children', 'mult',
-                 'copy_length', 'copy_consume', 'copy_produce')
+                 'copy_length', 'copy_consume', 'copy_produce', 'copy_yos')
 
     def __init__(self, kind, mult):
         self.kind = kind
@@ -545,6 +564,7 @@ class _View(object):
         self.copy_length = 0
         self.copy_consume = 0
         self.copy_produce = 0
+        self.copy_yos = 0
 
     @property
     def length(self):
@@ -565,6 +585,11 @@ class _View(object):
         """整个节点（含 mult 个副本）产出的出针数。"""
         return self.copy_produce * self.mult
 
+    @property
+    def yos(self):
+        """整个节点（含 mult 个副本）包含的零入针针法（yo）数。"""
+        return self.copy_yos * self.mult
+
 
 def _resolve_view(node, size_index):
     """把解析树节点按所选尺码定位成 _View（整棵树递归，副本不展开）。"""
@@ -576,6 +601,7 @@ def _resolve_view(node, size_index):
         view.copy_length = 1
         view.copy_consume = c0
         view.copy_produce = p0
+        view.copy_yos = 1 if c0 == 0 else 0
         return view
     view = _View('group', mult)
     children = [_resolve_view(ch, size_index) for ch in node.children]
@@ -583,6 +609,7 @@ def _resolve_view(node, size_index):
     view.copy_length = sum(ch.length for ch in children)
     view.copy_consume = sum(ch.consume for ch in children)
     view.copy_produce = sum(ch.produce for ch in children)
+    view.copy_yos = sum(ch.yos for ch in children)
     return view
 
 
@@ -661,5 +688,99 @@ def preview_row_stitches(text, num_sizes, size_index, start):
         "prev_start": prev_start,
         "next_start": end + 1 if end < total else None,
         "consume": sum(v.consume for v in views),
+        "produce": sum(v.produce for v in views),
+    }
+
+
+# ---------------------------------------------------------------------------
+# 跨行针位追踪：给定入针序号（1 起），定位该行实际由哪个针法消耗。定位同样
+# 只做算术：按“整段消耗”用除法跳过完整副本，绝不展开重复项，因此
+# (k2tog)*1000000000 中任一针也能瞬间定位。
+# ---------------------------------------------------------------------------
+
+
+def _locate_by_input(views, pos):
+    """定位消耗入针序号 pos（1 起，相对 views 序列起点）的针法。
+
+    返回 (记号名, 入针范围起始, 入针范围结束, 该针法的操作序号,
+           该针法之前的 yo 个数)。零入针的 yo 不消耗入针，遍历时整段跳过，
+    只累计“此前针法数/yo 数”；每个重复段先按 copy_consume 用除法定位副本
+    编号，十亿次重复也只需除法与取模。入针范围始终相对 views 序列起点
+    （整行），不随跳过的前段递减。
+    """
+    consumed_before = 0   # 此前各段已消耗的入针数
+    stitches_before = 0   # 此前的实际针法数（含 yo，决定操作序号）
+    yos_before = 0        # 此前的零入针针法（yo）数
+    for view in views:
+        if view.consume == 0:
+            # 整段都是零入针针法（如 (yo)*n）：不消耗入针，只累计针法数
+            stitches_before += view.length
+            yos_before += view.yos
+            continue
+        if pos > consumed_before + view.consume:
+            # 整段未命中：累计其消耗、针法数与 yo 后继续
+            consumed_before += view.consume
+            stitches_before += view.length
+            yos_before += view.yos
+            continue
+        local = pos - consumed_before  # 1 起，相对本段
+        if view.kind == 'stitch':
+            # 命中该记号的第 copy 个副本（k/p 每副本消耗 1，k2tog 消耗 2）
+            copy, _within = divmod(local - 1, view.copy_consume)
+            base = view.copy_consume * copy
+            return (view.name,
+                    consumed_before + base + 1,
+                    consumed_before + base + view.copy_consume,
+                    stitches_before + copy * view.copy_length + 1,
+                    yos_before + view.copy_yos * copy)
+        # 命中括号序列的第 copy 个副本中的第 inner 号入针：
+        # 用 copy_consume（而非 copy_length）定位副本，保证 (yo)*n 等
+        # 不消耗入针的重复段也能正确跳过
+        copy, inner = divmod(local - 1, view.copy_consume)
+        name, in_from, in_to, inside_seq, inside_yos = _locate_by_input(
+            view.children, inner + 1)
+        base = view.copy_consume * copy
+        return (name,
+                consumed_before + base + in_from,
+                consumed_before + base + in_to,
+                stitches_before + copy * view.copy_length + inside_seq,
+                yos_before + view.copy_yos * copy + inside_yos)
+    # 整段序列不消耗入针（如 (yo)*3）或 pos 越界（调用方已先校验）
+    raise StitchOutOfRangeError(consumed_before)
+
+
+def locate_row_input(text, num_sizes, size_index, input_pos):
+    """跨行追踪：定位一行中实际消耗第 input_pos 针（1 起）的针法。
+
+    与 preview_row_stitches 共用 parse_row_nodes/_resolve_view，故语法检查
+    与字符位置和校验接口完全一致。嵌套重复与 *{a|b|...} 按 size_index 指定
+    的尺码算术定位，绝不展开重复项。
+
+    返回 dict：
+      {"stitch", "in_from", "in_to", "seq", "yos_before",
+       "consume", "produce"}
+    其中 seq 为该针法在整行实际针法序列中的操作序号（1 起）；yos_before 为
+    该针法之前出现的 yo 个数（它们不消耗入针，只把后续出针序号推后）。
+    input_pos 超出该行实际消耗针数时抛 StitchOutOfRangeError。
+    """
+    if not isinstance(size_index, int) or isinstance(size_index, bool) \
+            or not (0 <= size_index < num_sizes):
+        raise ValueError("size_index 必须在尺码范围内")
+    if not isinstance(input_pos, int) or isinstance(input_pos, bool) \
+            or input_pos < 1:
+        raise ValueError("入针序号必须为正整数")
+    nodes = parse_row_nodes(text, num_sizes)
+    views = [_resolve_view(node, size_index) for node in nodes]
+    consume = sum(v.consume for v in views)
+    if input_pos > consume:
+        raise StitchOutOfRangeError(consume)
+    name, in_from, in_to, seq, yos_before = _locate_by_input(views, input_pos)
+    return {
+        "stitch": name,
+        "in_from": in_from,
+        "in_to": in_to,
+        "seq": seq,
+        "yos_before": yos_before,
+        "consume": consume,
         "produce": sum(v.produce for v in views),
     }

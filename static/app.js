@@ -711,3 +711,190 @@ previewSizeSelect.addEventListener('change', resetPreviewState);
 // 初始填充行与尺码列表
 fillPreviewLineSelect();
 fillPreviewSizeSelect();
+
+// ---------------------------------------------------------------------------
+// 跨行针位追踪
+// ---------------------------------------------------------------------------
+
+const trackSizeSelect = document.getElementById('track-size');
+const trackNeedleInput = document.getElementById('track-needle');
+const trackGoBtn = document.getElementById('track-go');
+const trackMessage = document.getElementById('track-message');
+const trackResult = document.getElementById('track-result');
+const trackMeta = document.getElementById('track-meta');
+const trackTableBody = document.querySelector('#track-table tbody');
+
+function fillTrackSizeSelect() {
+  const previous = trackSizeSelect.value;
+  trackSizeSelect.replaceChildren();
+  const sizes = readSizes();
+  let found = false;
+  sizes.forEach((s, i) => {
+    const option = document.createElement('option');
+    option.value = String(i);
+    option.textContent = s.name + '（起针 ' + (s.cast_on || '?') + '）';
+    trackSizeSelect.appendChild(option);
+    if (String(i) === previous) {
+      option.selected = true;
+      found = true;
+    }
+  });
+  if (!found && trackSizeSelect.options.length > 0) {
+    trackSizeSelect.options[0].selected = true;
+  }
+}
+
+function selectedTrackSize() {
+  const opt = trackSizeSelect.selectedOptions[0];
+  if (!opt) {
+    return null;
+  }
+  const sizes = readSizes();
+  const idx = Number(opt.value);
+  const raw = sizes[idx] ? sizes[idx].cast_on : NaN;
+  return { index: idx, castOn: Number(raw) };
+}
+
+function showTrackMessage(text) {
+  trackMessage.textContent = text;
+  trackMessage.className = 'move-message error';
+  trackMessage.hidden = false;
+}
+
+function hideTrackMessage() {
+  trackMessage.hidden = true;
+  trackMessage.textContent = '';
+}
+
+function formatTrackError(err) {
+  if (!err) {
+    return '追踪失败：未知错误';
+  }
+  if (err.type === 'parse') {
+    return '第 ' + err.line + ' 行指令无法解析（第 ' + (err.char || '?') +
+      ' 个字符）：' + err.message + '。追踪停在该行，上表为此前各有效行轨迹。';
+  }
+  if (err.type === 'count') {
+    const kind = err.diff > 0 ? '针数不足' : '针数多出';
+    return '第 ' + err.line + ' 行' + kind + '（差额 ' + Math.abs(err.diff) +
+      ' 针）：' + err.message + '。追踪停在该行，上表为此前各有效行轨迹。';
+  }
+  if (err.type === 'needle') {
+    return err.message;
+  }
+  if (err.type === 'size_index') {
+    return '尺码选择无效：' + err.message;
+  }
+  return '追踪失败：' + err.message;
+}
+
+function renderTracks(data, stopped) {
+  trackResult.hidden = false;
+  const tail = stopped
+    ? '　｜　已在首个错误行停止，下表保留此前 ' + data.tracks.length + ' 个有效行轨迹'
+    : '　｜　共追踪 ' + data.tracks.length + ' 个有效行，最终针位为第 ' +
+      data.final_needle + ' 针';
+  trackMeta.textContent =
+    '尺码 ' + data.size + '（起针 ' + data.cast_on +
+    '）　｜　起针序号：第 ' + data.needle + ' 针' + tail;
+
+  trackTableBody.replaceChildren();
+  for (const t of data.tracks) {
+    const tr = document.createElement('tr');
+    tr.className = t.stitch === 'k2tog' ? 'track-k2tog' : '';
+
+    const rangeText = t.in_from === t.in_to
+      ? '第 ' + t.in_from + ' 针'
+      : '第 ' + t.in_from + '–' + t.in_to + ' 针';
+    const mergedText = t.merged_with === null
+      ? '—'
+      : '与第 ' + t.merged_with + ' 针合并';
+    const values = [
+      t.line,
+      t.instruction,
+      '第 ' + t.needle_in + ' 针',
+      t.stitch,
+      rangeText,
+      mergedText,
+      String(t.yos_before),
+      '第 ' + t.out_needle + ' 针',
+    ];
+    for (const value of values) {
+      const td = document.createElement('td');
+      td.textContent = value;
+      tr.appendChild(td);
+    }
+    trackTableBody.appendChild(tr);
+  }
+}
+
+async function requestTrack() {
+  fillTrackSizeSelect();
+  hideTrackMessage();
+
+  const picked = selectedTrackSize();
+  if (picked === null || !Number.isInteger(picked.castOn)) {
+    showTrackMessage('请先在上方填写至少一个带正整数起针数的有效尺码。');
+    trackResult.hidden = true;
+    return;
+  }
+  const needle = Number(trackNeedleInput.value);
+  if (!Number.isInteger(needle) || needle < 1) {
+    showTrackMessage('起针序号必须为正整数。');
+    trackResult.hidden = true;
+    return;
+  }
+  if (needle > picked.castOn) {
+    showTrackMessage('起针序号越界：所选尺码起针 ' + picked.castOn +
+      ' 针，序号必须在 1~' + picked.castOn + ' 之间。');
+    trackResult.hidden = true;
+    return;
+  }
+
+  let data;
+  try {
+    const res = await fetch('/api/track-stitch', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        sizes: readSizes(),
+        pattern: patternInput.value,
+        size_index: picked.index,
+        needle: needle,
+      }),
+    });
+    data = await res.json();
+  } catch (err) {
+    showTrackMessage('追踪请求失败：' + err.message);
+    trackResult.hidden = true;
+    return;
+  }
+
+  if (!data.ok && (!Array.isArray(data.tracks) || data.tracks.length === 0)) {
+    // 起针越界、尺码非法等：没有任何有效行轨迹
+    trackResult.hidden = true;
+    showTrackMessage(formatTrackError(data.error));
+    return;
+  }
+
+  renderTracks(data, !data.ok);
+  if (!data.ok) {
+    showTrackMessage(formatTrackError(data.error));
+  }
+}
+
+trackGoBtn.addEventListener('click', requestTrack);
+trackNeedleInput.addEventListener('keydown', (event) => {
+  if (event.key === 'Enter') {
+    event.preventDefault();
+    requestTrack();
+  }
+});
+sizesList.addEventListener('change', fillTrackSizeSelect);
+sizesList.addEventListener('input', fillTrackSizeSelect);
+patternInput.addEventListener('input', () => {
+  trackResult.hidden = true;
+  hideTrackMessage();
+});
+
+fillTrackSizeSelect();
