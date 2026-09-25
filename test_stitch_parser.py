@@ -4,6 +4,7 @@ from stitch_parser import (
     PREVIEW_PAGE_SIZE,
     ParseError,
     PreviewStartError,
+    TrackStartError,
     parse_row,
     parse_row_details,
     parse_row_nodes,
@@ -12,6 +13,9 @@ from stitch_parser import (
     preview_row_stitches,
     reorder_size_multipliers,
     suggest_row_fix,
+    trace_row_input,
+    _resolve_view,
+    STITCH_COUNTS,
 )
 
 
@@ -588,6 +592,173 @@ class TestPreviewRowStitches(unittest.TestCase):
         self.assertEqual((c, p), ([14, 15], [17, 18]))
         self.assertEqual(len(nodes), 2)
         self.assertEqual(tallies['k'], [8, 9])
+
+
+def _brute_consume(text, num_sizes, size_index, in_pos):
+    """展开整行（仅用于小倍数用例）后逐操作模拟，供与 trace_row_input 对照。"""
+    views = [_resolve_view(n, size_index)
+             for n in parse_row_nodes(text, num_sizes)]
+
+    def expand(view):
+        if view.kind == 'stitch':
+            return [view.name] * view.mult
+        out = []
+        for _ in range(view.mult):
+            for ch in view.children:
+                out.extend(expand(ch))
+        return out
+
+    ops = []
+    for view in views:
+        ops.extend(expand(view))
+    consumed = 0
+    for seq, name in enumerate(ops, 1):
+        c0 = STITCH_COUNTS[name][0]
+        if c0 and consumed < in_pos <= consumed + c0:
+            in_from, in_to = consumed + 1, consumed + c0
+            merge_with = None
+            merge_side = None
+            if name == 'k2tog':
+                merge_with = in_to if in_pos == in_from else in_from
+                merge_side = 'right' if merge_with > in_pos else 'left'
+            return {
+                'stitch': name, 'seq': seq,
+                'in_from': in_from, 'in_to': in_to, 'out': seq,
+                'merge_with': merge_with, 'merge_side': merge_side,
+            }
+        consumed += c0
+    return None
+
+
+class TestTraceRowInput(unittest.TestCase):
+    def test_flat_stitches_and_yo_skipped(self):
+        # yo k yo k2tog：入针 1 被第 2 个操作（k）消耗；入针 3 是 k2tog 的第2针
+        r = trace_row_input('yo k yo k2tog', 1, 0, 1)
+        self.assertEqual((r['stitch'], r['seq'], r['in_from'], r['in_to'], r['out']),
+                         ('k', 2, 1, 1, 2))
+        self.assertIsNone(r['merge_with'])
+        r = trace_row_input('yo k yo k2tog', 1, 0, 3)
+        self.assertEqual((r['stitch'], r['seq']), ('k2tog', 4))
+        self.assertEqual((r['merge_with'], r['merge_side']), (2, 'left'))
+
+    def test_k2tog_merge_left_and_right(self):
+        r = trace_row_input('k2tog*2', 1, 0, 3)
+        self.assertEqual(r['stitch'], 'k2tog')
+        self.assertEqual((r['in_from'], r['in_to']), (3, 4))
+        self.assertEqual(r['seq'], 2)
+        self.assertEqual((r['merge_with'], r['merge_side']), (4, 'right'))
+        r = trace_row_input('k2tog*2', 1, 0, 4)
+        self.assertEqual((r['merge_with'], r['merge_side']), (3, 'left'))
+        # k/p 不产生合并标记
+        r = trace_row_input('k p', 1, 0, 2)
+        self.assertIsNone(r['merge_with'])
+        self.assertIsNone(r['merge_side'])
+
+    def test_multiple_top_level_views(self):
+        # 顶层多个视图：k2tog*2 消耗1-4，k*3 消耗5-7
+        r = trace_row_input('k2tog*2 k*3', 1, 0, 5)
+        self.assertEqual((r['stitch'], r['seq'], r['in_from'], r['in_to']),
+                         ('k', 3, 5, 5))
+        r = trace_row_input('k2tog*2 k*3', 1, 0, 4)
+        self.assertEqual((r['stitch'], r['seq']), ('k2tog', 2))
+
+    def test_nested_groups(self):
+        # ((k yo)*2 k2tog)*3：消耗 12，共 15 个实际针法
+        for pos in range(1, 13):
+            r = trace_row_input('((k yo)*2 k2tog)*3', 1, 0, pos)
+            b = _brute_consume('((k yo)*2 k2tog)*3', 1, 0, pos)
+            for key in ('stitch', 'seq', 'in_from', 'in_to', 'out',
+                        'merge_with', 'merge_side'):
+                self.assertEqual(r[key], b[key], msg=(pos, key))
+
+    def test_brute_force_cross_check_small_cases(self):
+        cases = [
+            ('k p yo k2tog', 1, 0),
+            ('(k2tog yo)*2', 1, 0),
+            ('yo k yo k2tog', 1, 0),
+            ('k2tog*2 k*3', 1, 0),
+            ('(yo k2tog)*3 k*4', 1, 0),
+            ('(k p)*2 (k2tog yo k)*2', 1, 0),
+            ('(yo)*5 k2tog', 1, 0),
+            ('((k2tog yo)*{2|3} k)*{3|2}', 2, 0),
+            ('((k2tog yo)*{2|3} k)*{3|2}', 2, 1),
+            ('k*{12|16|20}', 3, 2),
+        ]
+        for text, num_sizes, size_index in cases:
+            views = [_resolve_view(n, size_index)
+                     for n in parse_row_nodes(text, num_sizes)]
+            consume = sum(v.consume for v in views)
+            for pos in range(1, consume + 1):
+                r = trace_row_input(text, num_sizes, size_index, pos)
+                b = _brute_consume(text, num_sizes, size_index, pos)
+                self.assertEqual(
+                    {k: r[k] for k in ('stitch', 'seq', 'in_from', 'in_to',
+                                       'out', 'merge_with', 'merge_side')},
+                    b, msg=(text, pos))
+
+    def test_huge_repeat_uses_division_no_expansion(self):
+        # 十亿次重复：只做除法定位，不能展开
+        r = trace_row_input('(k yo)*1000000000', 1, 0, 1000000000)
+        self.assertEqual((r['stitch'], r['seq'], r['in_from'], r['in_to']),
+                         ('k', 1999999999, 1000000000, 1000000000))
+        self.assertEqual(r['total'], 2000000000)
+        r = trace_row_input('k2tog*1000000000', 1, 0, 1999999999)
+        self.assertEqual((r['stitch'], r['seq'], r['in_from'], r['in_to']),
+                         ('k2tog', 1000000000, 1999999999, 2000000000))
+        self.assertEqual((r['merge_with'], r['merge_side']),
+                         (2000000000, 'right'))
+        r = trace_row_input('k2tog*1000000000', 1, 0, 2000000000)
+        self.assertEqual((r['merge_with'], r['merge_side']),
+                         (1999999999, 'left'))
+
+    def test_nested_huge_repeat(self):
+        # 外层十亿、内层结构固定：(k k2tog)*1000000000 每组消耗3产出2
+        r = trace_row_input('(k k2tog)*1000000000', 1, 0, 3000000000)
+        self.assertEqual(r['stitch'], 'k2tog')
+        self.assertEqual((r['in_from'], r['in_to']),
+                         (2999999999, 3000000000))
+        self.assertEqual(r['seq'], 2000000000)
+
+    def test_size_specific_multipliers(self):
+        # k*{12|16|20}：三个尺码分别追踪末针
+        for size_index, last in ((0, 12), (1, 16), (2, 20)):
+            r = trace_row_input('k*{12|16|20}', 3, size_index, last)
+            self.assertEqual((r['stitch'], r['seq'], r['in_from']),
+                             ('k', last, last))
+            self.assertEqual(r['consume'], last)
+
+    def test_out_of_range(self):
+        with self.assertRaises(TrackStartError) as ctx:
+            trace_row_input('k*3', 1, 0, 4)
+        self.assertEqual(ctx.exception.total, 3)
+        # 整行只有挂线：消耗 0，任何入针序号都越界
+        with self.assertRaises(TrackStartError) as ctx:
+            trace_row_input('(yo)*3', 1, 0, 1)
+        self.assertEqual(ctx.exception.total, 0)
+
+    def test_invalid_arguments(self):
+        for bad in [0, -1, '1', 1.0, True, None]:
+            with self.assertRaises(ValueError, msg=repr(bad)):
+                trace_row_input('k*3', 1, 0, bad)
+        for bad in [-1, 2, '0', 1.0, True, None]:
+            with self.assertRaises(ValueError, msg=repr(bad)):
+                trace_row_input('k*{1|2}', 2, bad, 1)
+
+    def test_parse_error_same_position(self):
+        # 与 parse_row_details 完全相同的 ParseError 与字符位置
+        for bad in ['ssk', '(k yo', 'k)', '()', 'k*0', 'k*{1}']:
+            with self.assertRaises(ParseError, msg=bad) as ctx_trace:
+                trace_row_input(bad, 2, 0, 1)
+            with self.assertRaises(ParseError) as ctx_parse:
+                parse_row_details(bad, 2)
+            self.assertEqual(str(ctx_trace.exception),
+                             str(ctx_parse.exception), msg=bad)
+            self.assertEqual(ctx_trace.exception.pos,
+                             ctx_parse.exception.pos, msg=bad)
+
+    def test_empty_row_is_parse_error(self):
+        with self.assertRaises(ParseError):
+            trace_row_input('   ', 1, 0, 1)
 
 
 if __name__ == '__main__':

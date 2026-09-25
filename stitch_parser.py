@@ -25,6 +25,12 @@ reorder_size_multipliers 在尺码顺序调整（上移/下移）时，按新顺
 中所有 *{a|b|...} 的倍数项：嵌套重复与同一行多处都会处理，普通 *n 与其他
 原文保持不变；任一处项数或数值不合法时抛 ParseError 并给出字符位置，调用
 方可据此中止整次移动。
+
+针位定位分两个方向，且都不展开重复：preview_row_stitches 按操作序号正查
+入针范围（单行分页预览），trace_row_input 按入针序号反查消耗它的操作
+（跨行针位追踪）。两者复用同一解析树与 _View 算术视图，命中重复段时先算
+整段长度/消耗，再用除法跳过整段副本，故 (k)*1000000000 中任意针位都只需
+几次除法即可定位。
 """
 
 import re
@@ -74,6 +80,17 @@ class PreviewStartError(ValueError):
 
     def __init__(self, total):
         super().__init__("起始操作序号超出范围：本行共 {} 个实际针法".format(total))
+        self.total = total
+
+
+class TrackStartError(ValueError):
+    """跨行针位追踪的起针序号（或中途针位）超出该行实际消耗的入针数。
+
+    total 为该行（所选尺码下）的消耗针数，调用方可据此提示范围。
+    """
+
+    def __init__(self, total):
+        super().__init__("起针序号超出范围：该行只消耗 {} 针".format(total))
         self.total = total
 
 
@@ -662,4 +679,109 @@ def preview_row_stitches(text, num_sizes, size_index, start):
         "next_start": end + 1 if end < total else None,
         "consume": sum(v.consume for v in views),
         "produce": sum(v.produce for v in views),
+    }
+
+
+# ---------------------------------------------------------------------------
+# 跨行针位追踪：给定所选尺码下某一行上的一个针位（1 起），反向定位它在该行
+# 被哪个实际针法消耗。与预览同一条解析路径（parse_row_nodes）与同一套 _View
+# 算术定位，只是方向相反——预览按操作序号查入针范围，追踪按入针序号查操作。
+# 定位同样只做算术（先算整段消耗/长度，再用除法跳过整段副本），绝不展开
+# 重复项，因此十亿次重复中追踪一个针位也只需几次除法。
+# ---------------------------------------------------------------------------
+
+
+def _locate_consuming_operation(views, in_pos):
+    """定位入针序号 in_pos（1 起，相对 views 序列起点）被哪个操作消耗。
+
+    返回 (记号名, 操作全局序号 seq, 入针起点 in_from, 入针终点 in_to,
+    该操作产出的出针序号 out)，序号均相对 views 序列起点且从 1 计。
+
+    遍历每个顶层视图并扣除整段消耗；命中后先换算成“该视图内”的局部入针
+    序号，再（组视图）用除法定位到具体副本——纯 yo 等零消耗视图整段跳过，
+    绝不逐枚遍历副本。挂线（yo）不消耗入针，但仍把它的针法数计入其后方
+    操作的全局序号。
+    """
+    consumed_before = 0  # 已整段跳过的视图消耗的入针数
+    ops_before = 0       # 已整段跳过的视图包含的实际针法（操作）数
+    for view in views:
+        if in_pos > consumed_before + view.consume:
+            # 整段未命中：该视图消耗的针都在 in_pos 之前
+            consumed_before += view.consume
+            ops_before += view.length
+            continue
+        local = in_pos - consumed_before  # 该视图内的局部入针序号（1 起）
+        if view.kind == 'stitch':
+            # 命中该记号的某个副本。k/p/k2tog 每副本消耗 copy_consume>0，
+            # 用除法一次跳过 (local-1)//copy_consume 个完整副本
+            prior_copies = (local - 1) // view.copy_consume
+            seq = ops_before + prior_copies * view.copy_length + 1
+            in_from = consumed_before + prior_copies * view.copy_consume + 1
+            in_to = consumed_before + (prior_copies + 1) * view.copy_consume
+            return (view.name, seq, in_from, in_to, seq)
+        # 组视图：定位到消耗 local 的那个副本。copy_consume 为 0（括号内全是
+        # yo）的视图在上方条件处必被整段跳过，这里仅作防御性兜底。
+        if view.copy_consume:
+            copy = (local - 1) // view.copy_consume
+            within_consumed = (local - 1) % view.copy_consume
+        else:
+            copy, within_consumed = 0, local - 1
+        # 组内递归：坐标换算成“该副本内”的入针序号（1 起）；递归返回的
+        # inner_seq 与 inner_from 均相对该副本起点
+        name, inner_seq, inner_from, _inner_to, _inner_out = \
+            _locate_consuming_operation(view.children, within_consumed + 1)
+        c0 = STITCH_COUNTS[name][0]
+        seq = ops_before + copy * view.copy_length + inner_seq
+        consumed_before_op = (
+            consumed_before + view.copy_consume * copy + (inner_from - 1))
+        in_from = consumed_before_op + 1
+        in_to = consumed_before_op + c0
+        return (name, seq, in_from, in_to, seq)
+    raise IndexError("入针序号超出范围")
+
+
+def trace_row_input(text, num_sizes, size_index, in_pos):
+    """单行针位追踪：返回入针序号 in_pos 在该行被消耗的现场。
+
+    in_pos 为 1 起的入针序号（即上一行产出/起针时的针位）；嵌套重复与
+    *{...} 按 size_index 指定的尺码算术定位，不展开重复项。非法行抛出与
+    parse_row_details 相同的 ParseError（同一字符位置）；in_pos 超出该行
+    （所选尺码下）消耗针数时抛 TrackStartError。
+
+    返回 dict：
+      {"stitch", "seq", "in_from", "in_to", "out",
+       "merge_with", "merge_side", "consume", "produce", "total"}
+    k2tog 时 merge_with 为与其合并的相邻针序号（同组入针范围的另一端），
+    merge_side 为 "left"/"right" 标明该相邻针在追踪针的左侧还是右侧；
+    其余针法 merge_with/merge_side 为 None。yo 不会出现在结果中（挂线不
+    消耗任何入针）。
+    """
+    if not isinstance(size_index, int) or isinstance(size_index, bool) \
+            or not (0 <= size_index < num_sizes):
+        raise ValueError("size_index 必须在尺码范围内")
+    if not isinstance(in_pos, int) or isinstance(in_pos, bool) or in_pos < 1:
+        raise ValueError("in_pos 必须为正整数")
+    nodes = parse_row_nodes(text, num_sizes)
+    views = [_resolve_view(node, size_index) for node in nodes]
+    consume = sum(v.consume for v in views)
+    if in_pos > consume:
+        raise TrackStartError(consume)
+    name, seq, in_from, in_to, out = _locate_consuming_operation(views, in_pos)
+    merge_with = None
+    merge_side = None
+    if name == 'k2tog':
+        # k2tog 一次消耗两枚相邻入针：同组 in_from..in_to 中的另一端
+        merge_with = in_to if in_pos == in_from else in_from
+        merge_side = 'right' if merge_with > in_pos else 'left'
+    return {
+        "stitch": name,
+        "seq": seq,
+        "in_from": in_from,
+        "in_to": in_to,
+        "out": out,
+        "merge_with": merge_with,
+        "merge_side": merge_side,
+        "consume": consume,
+        "produce": sum(v.produce for v in views),
+        "total": sum(v.length for v in views),
     }

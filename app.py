@@ -50,6 +50,22 @@ POST /api/preview-row    单行针位预览（不展开重复项，可直接看�
   失败: {"ok": false, "error": {"type": "sizes"|"line"|"start"|"size_index"
          |"parse", ...}}
 
+POST /api/track-needle   跨行针位追踪（选定尺码与一枚起针序号，逐行追踪去向）
+  请求: {"sizes": [...], "pattern": "...", "size_index": 0, "start": 1}
+    size_index 为尺码下标（0 起），start 为起针序号（1 起，不得超过该尺码
+    起针数）。逐行按所选尺码解析嵌套重复与 *{...}（不展开重复项），把上
+    一行的产出针位作为下一行入针序号。
+  成功: {"ok": true, "size", "size_index", "cast_on", "start",
+         "rows": [{"line", "instruction", "pos_in", "stitch", "seq", "total",
+                   "in_from", "in_to", "merge_with", "merge_side",
+                   "pos_out", "consume", "produce"}, ...],
+         "error": null, "final_pos", "final"}
+    merge_with/merge_side 仅 k2tog 行非空，标明与相邻针合并；yo 不消耗入针，
+    不会作为命中行。遇针数不符或语法错误停在首个错误行，rows 保留此前轨迹，
+    error 为 "count"（带 diff）或 "parse"（带字符位置 char）。
+  失败: {"ok": false, "rows": [...此前轨迹...], "error": {"type": ...}}
+    起针序号越界（或中途针位超出该行消耗数）为 "start"/"count" 类错误。
+
 逐行推算规则：每个尺码独立地以上一行的产出作为下一行的可用针数；某尺码
 消耗与可用针数不一致（不足或超出）时，仅该尺码停止并记录行号与差额，
 其余尺码继续推算。指令本身无法解析（含 *{a|b} 项数与尺码数不符、倍数
@@ -80,11 +96,13 @@ from stitch_parser import (
     STITCH_NAMES,
     ParseError,
     PreviewStartError,
+    TrackStartError,
     parse_row,
     parse_row_details,
     preview_row_stitches,
     reorder_size_multipliers,
     suggest_row_fix,
+    trace_row_input,
 )
 
 app = Flask(__name__)
@@ -559,6 +577,126 @@ def preview_row():
         "prev_start": preview["prev_start"],
         "next_start": preview["next_start"],
     })
+
+
+@app.post("/api/track-needle")
+def track_needle():
+    """跨行针位追踪：选定尺码与一枚起针序号，逐行追踪它的去向。
+
+    逐行按所选尺码解析嵌套重复与 *{...}（同一套解析/校验规则，不展开重复
+    项），把上一行的产出针位作为下一行的入针序号；每行记录该针位被哪个
+    实际针法消耗、该操作的入针范围与产出针位。k2tog 时标明与相邻针合并
+    （merge_with/merge_side）；yo 不消耗入针，只影响后续位置，不会作为
+    命中行出现。遇所选尺码针数不符或任一行语法错误时停在首个错误行，
+    保留此前轨迹并给出原文行号（语法错误另给字符位置）。起针序号超出
+    起针数（或中途针位超出该行消耗数）时明确报错。
+    """
+    data = request.get_json(silent=True) or {}
+
+    sizes, err = _parse_sizes(data.get("sizes"))
+    if err:
+        return jsonify({
+            "ok": False,
+            "error": {"line": None, "type": "sizes", "message": err},
+        })
+
+    pattern = data.get("pattern", "")
+    if not isinstance(pattern, str):
+        pattern = str(pattern)
+
+    num_sizes = len(sizes)
+    size_index = data.get("size_index", 0)
+    if isinstance(size_index, bool) or not isinstance(size_index, int) \
+            or not (0 <= size_index < num_sizes):
+        return jsonify({
+            "ok": False,
+            "error": {"line": None, "type": "size_index",
+                      "message": "尺码下标必须在 0~{} 之间".format(num_sizes - 1)},
+        })
+
+    start = data.get("start")
+    if isinstance(start, bool) or not isinstance(start, int) or start < 1:
+        return jsonify({
+            "ok": False,
+            "error": {"line": None, "type": "start",
+                      "message": "起针序号必须为正整数"},
+        })
+
+    cast_on = sizes[size_index]["cast_on"]
+    if start > cast_on:
+        return jsonify({
+            "ok": False,
+            "rows": [],
+            "error": {"line": None, "type": "start", "cast_on": cast_on,
+                      "message": "起针序号超出范围：尺码 {} 共起 {} 针，"
+                                 "请把序号改到 1~{} 之间".format(
+                                     sizes[size_index]["name"], cast_on, cast_on)},
+        })
+
+    trace_rows = []
+    error = None
+    pos = start          # 当前行的入针序号（1 起）
+    available = cast_on  # 当前行可用（应消耗）针数
+    for lineno, raw_line in enumerate(pattern.splitlines(), 1):
+        text = raw_line.strip()
+        if not text:  # 跳过空行，行号仍按原始文本计算
+            continue
+        try:
+            hit = trace_row_input(text, num_sizes, size_index, pos)
+        except TrackStartError as exc:
+            # 与针数不符是同一语义：该尺码在这一行停下，轨迹保留此前各行
+            error = {
+                "line": lineno,
+                "type": "count",
+                "instruction": text,
+                "available": available,
+                "consume": exc.total,
+                "diff": exc.total - available,
+                "message": "追踪在第 {} 行中断：该行只消耗 {} 针，当前针位 {} 不在其中".format(
+                    lineno, exc.total, pos),
+            }
+            break
+        except ParseError as exc:
+            # 与校验接口完全一致的语法错误对象（同一原文行号与字符位置）
+            error = _parse_error_obj(lineno, text, exc)
+            break
+        consume, produce = hit["consume"], hit["produce"]
+        if consume != available:
+            error = _count_error_obj(lineno, text, available, consume)
+            break
+        trace_rows.append({
+            "line": lineno,
+            "instruction": text,
+            "pos_in": pos,
+            "stitch": hit["stitch"],
+            "seq": hit["seq"],
+            "total": hit["total"],
+            "in_from": hit["in_from"],
+            "in_to": hit["in_to"],
+            "merge_with": hit["merge_with"],
+            "merge_side": hit["merge_side"],
+            "pos_out": hit["out"],
+            "consume": consume,
+            "produce": produce,
+        })
+        # 该行每个操作恰好产出 1 针，产出针位即下一行入针序号；
+        # 针位序号在各行独立编号（yo 等零消耗针法会改变后续行的位置）
+        pos = hit["out"]
+        available = produce
+
+    result = {
+        "ok": error is None,
+        "size": sizes[size_index]["name"],
+        "size_index": size_index,
+        "cast_on": cast_on,
+        "start": start,
+        "rows": trace_rows,
+        "error": error,
+    }
+    if error is None:
+        result["final_pos"] = pos
+        result["final"] = available
+    return jsonify(result)
 
 
 def _yarn_summary(yarn, state):

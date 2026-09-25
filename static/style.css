@@ -449,3 +449,96 @@ button.small {
 #preview-table tr.preview-yo td.preview-stitch {
   color: #8a611c;
 }
+
+/* 跨行针位追踪 */
+.track-section {
+  margin-top: 32px;
+  padding-top: 16px;
+  border-top: 2px dashed #c9c2b2;
+}
+
+.track-section h2 {
+  font-size: 1.2rem;
+}
+
+.track-controls {
+  display: flex;
+  gap: 16px;
+  align-items: flex-end;
+  flex-wrap: wrap;
+  margin-bottom: 10px;
+}
+
+.track-item {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.track-item span {
+  font-weight: 600;
+  font-size: 0.92rem;
+}
+
+.track-item select {
+  width: 260px;
+  padding: 8px 10px;
+  border: 1px solid #c9c2b2;
+  border-radius: 6px;
+  background: #fff;
+  font-size: 0.95rem;
+}
+
+.track-item input[type="number"] {
+  width: 160px;
+  max-width: none;
+}
+
+.track-actions {
+  padding-bottom: 2px;
+}
+
+.track-meta {
+  padding: 10px 14px;
+  border-radius: 6px;
+  margin: 10px 0;
+  background: #ece7da;
+  font-size: 0.92rem;
+  line-height: 1.7;
+  font-family: ui-monospace, Menlo, Consolas, monospace;
+  overflow-x: auto;
+}
+
+#track-table td.track-stitch {
+  font-weight: 600;
+}
+
+#track-table td.track-merge {
+  color: #a05a18;
+  font-weight: 600;
+}
+
+#track-table td.track-out {
+  font-weight: 600;
+}
+
+#track-table tr.track-k2tog td {
+  background: #fdeede;
+}
+
+.track-final {
+  margin-top: 10px;
+  padding: 10px 14px;
+  border-radius: 6px;
+  font-size: 0.95rem;
+}
+
+.track-final.ok {
+  background: #e0efdd;
+  color: #2e6b2e;
+}
+
+.track-final.error {
+  background: #f8e1e1;
+  color: #a33;
+}

@@ -711,3 +711,205 @@ previewSizeSelect.addEventListener('change', resetPreviewState);
 // 初始填充行与尺码列表
 fillPreviewLineSelect();
 fillPreviewSizeSelect();
+
+// ---------------------------------------------------------------------------
+// 跨行针位追踪
+// ---------------------------------------------------------------------------
+
+const trackSizeSelect = document.getElementById('track-size');
+const trackStartInput = document.getElementById('track-start');
+const trackGoBtn = document.getElementById('track-go');
+const trackMessage = document.getElementById('track-message');
+const trackResult = document.getElementById('track-result');
+const trackMeta = document.getElementById('track-meta');
+const trackTableBody = document.querySelector('#track-table tbody');
+const trackFinalBox = document.getElementById('track-final');
+
+function fillTrackSizeSelect() {
+  const previous = trackSizeSelect.value;
+  trackSizeSelect.replaceChildren();
+  const sizes = readSizes();
+  let found = false;
+  sizes.forEach((s, i) => {
+    const option = document.createElement('option');
+    option.value = String(i);
+    option.textContent = s.name + '（起针 ' + (s.cast_on || '?') + '）';
+    trackSizeSelect.appendChild(option);
+    if (String(i) === previous) {
+      option.selected = true;
+      found = true;
+    }
+  });
+  if (!found && trackSizeSelect.options.length > 0) {
+    trackSizeSelect.options[0].selected = true;
+  }
+}
+
+function showTrackMessage(text) {
+  trackMessage.textContent = text;
+  trackMessage.className = 'move-message error';
+  trackMessage.hidden = false;
+}
+
+function hideTrackMessage() {
+  trackMessage.hidden = true;
+  trackMessage.textContent = '';
+}
+
+function formatTrackError(err) {
+  if (!err) {
+    return '追踪失败：未知错误';
+  }
+  if (err.type === 'parse') {
+    return '第 ' + err.line + ' 行指令无法解析（第 ' + (err.char || '?') +
+      ' 个字符）：' + err.message + '；已保留此前 ' + '各行的轨迹。';
+  }
+  if (err.type === 'count') {
+    const kind = err.diff > 0 ? '针数不足' : '针数不符（该行未消耗全部入针）';
+    return '第 ' + err.line + ' 行' + kind + '：' + err.message +
+      '；追踪在此停止，表中保留此前各行的轨迹。';
+  }
+  if (err.type === 'start') {
+    return err.message;
+  }
+  if (err.type === 'size_index') {
+    return '尺码选择无效：' + err.message;
+  }
+  return '追踪失败：' + err.message;
+}
+
+function td(value) {
+  const cell = document.createElement('td');
+  cell.textContent = value;
+  return cell;
+}
+
+function renderTrack(data) {
+  trackResult.hidden = false;
+  hideTrackMessage();
+
+  trackMeta.textContent =
+    '尺码 ' + data.size + '（起针 ' + data.cast_on.toLocaleString('zh-CN') +
+    '）　｜　追踪起针序号：第 ' + data.start.toLocaleString('zh-CN') + ' 枚' +
+    '　｜　有效行 ' + data.rows.length + ' 行';
+
+  trackTableBody.replaceChildren();
+  for (const row of data.rows) {
+    const tr = document.createElement('tr');
+    tr.className = row.stitch === 'yo' ? 'track-yo' : '';
+    if (row.stitch === 'k2tog') {
+      tr.classList.add('track-k2tog');
+    }
+
+    tr.appendChild(td(row.line));
+    tr.appendChild(td(row.instruction));
+    tr.appendChild(td('第 ' + row.pos_in.toLocaleString('zh-CN') + ' 枚'));
+
+    const stitchTd = document.createElement('td');
+    stitchTd.textContent = row.stitch;
+    stitchTd.className = 'track-stitch';
+    tr.appendChild(stitchTd);
+
+    tr.appendChild(td('第 ' + row.seq.toLocaleString('zh-CN') +
+      ' / ' + row.total.toLocaleString('zh-CN') + ' 个'));
+
+    const range = row.in_from === row.in_to
+      ? '第 ' + row.in_from.toLocaleString('zh-CN') + ' 枚'
+      : '第 ' + row.in_from.toLocaleString('zh-CN') + '–' +
+        row.in_to.toLocaleString('zh-CN') + ' 枚';
+    tr.appendChild(td(range));
+
+    const mergeTd = document.createElement('td');
+    if (row.merge_with !== null) {
+      const arrow = row.merge_side === 'right' ? '→' : '←';
+      mergeTd.textContent =
+        (row.merge_side === 'right' ? '与右侧第 ' : '与左侧第 ') +
+        row.merge_with.toLocaleString('zh-CN') + ' 枚合并 ' + arrow;
+      mergeTd.className = 'track-merge';
+    } else {
+      mergeTd.textContent = '—';
+    }
+    tr.appendChild(mergeTd);
+
+    const outTd = document.createElement('td');
+    outTd.textContent = '第 ' + row.pos_out.toLocaleString('zh-CN') + ' 枚';
+    outTd.className = 'track-out';
+    tr.appendChild(outTd);
+
+    trackTableBody.appendChild(tr);
+  }
+
+  if (data.ok) {
+    trackFinalBox.className = 'track-final ok';
+    trackFinalBox.textContent =
+      '追踪完成：起针第 ' + data.start.toLocaleString('zh-CN') +
+      ' 枚最终是第 ' + (data.final_pos || 0).toLocaleString('zh-CN') +
+      ' 枚（最后一行后共 ' + data.final.toLocaleString('zh-CN') + ' 枚针）。';
+  } else {
+    trackFinalBox.className = 'track-final error';
+    trackFinalBox.textContent = '追踪在第 ' + data.error.line + ' 行停止：' +
+      (data.error.type === 'parse' ? '语法错误（第 ' + (data.error.char || '?') + ' 个字符）' : '该尺码针数不符') +
+      '，表中保留此前 ' + data.rows.length + ' 行轨迹。';
+    showTrackMessage(formatTrackError(data.error));
+  }
+}
+
+async function requestTrack() {
+  fillTrackSizeSelect();
+  hideTrackMessage();
+
+  const sizeOpt = trackSizeSelect.selectedOptions[0];
+  if (!sizeOpt) {
+    showTrackMessage('请先在上方填写至少一个有效尺码（名称与正整数起针数）。');
+    trackResult.hidden = true;
+    return;
+  }
+  const start = Number(trackStartInput.value);
+  if (!Number.isInteger(start) || start < 1) {
+    showTrackMessage('起针序号必须为正整数。');
+    trackResult.hidden = true;
+    return;
+  }
+
+  let data;
+  try {
+    const res = await fetch('/api/track-needle', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        sizes: readSizes(),
+        pattern: patternInput.value,
+        size_index: Number(sizeOpt.value),
+        start: start,
+      }),
+    });
+    data = await res.json();
+  } catch (err) {
+    showTrackMessage('追踪请求失败：' + err.message);
+    return;
+  }
+
+  if (!data.ok && (!data.error || data.error.line === null)) {
+    // 尺码非法/尺码下标非法/起针越界等：尚无任何轨迹（行级错误才带行号）
+    trackResult.hidden = true;
+    showTrackMessage(formatTrackError(data.error));
+    if (data.error && data.error.type === 'start' && data.error.cast_on !== undefined) {
+      trackStartInput.value = String(data.error.cast_on);
+    }
+    return;
+  }
+  renderTrack(data);
+}
+
+trackGoBtn.addEventListener('click', requestTrack);
+trackStartInput.addEventListener('keydown', (event) => {
+  if (event.key === 'Enter') {
+    event.preventDefault();
+    requestTrack();
+  }
+});
+sizesList.addEventListener('change', fillTrackSizeSelect);
+sizesList.addEventListener('input', fillTrackSizeSelect);
+
+// 初始填充尺码列表
+fillTrackSizeSelect();

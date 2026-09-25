@@ -786,5 +786,227 @@ class TestPreviewRowApi(unittest.TestCase):
                          ['k', 'yo', 'k', 'yo', 'k'])
 
 
+class TestTrackNeedleApi(unittest.TestCase):
+    SIZES = [{'name': 'S', 'cast_on': 12},
+             {'name': 'M', 'cast_on': 16},
+             {'name': 'L', 'cast_on': 20}]
+    PATTERN = '\n'.join([
+        '(k2tog yo)*{6|8|10}',
+        'p*{12|16|20}',
+        '',
+        '(k2tog)*{6|8|10}',
+        '(k2tog)*{3|4|5}',
+        'k*{3|4|5}',
+    ])
+
+    def setUp(self):
+        self.client = app.test_client()
+
+    def track(self, size_index, start, sizes=None, pattern=None):
+        return self.client.post('/api/track-needle', json={
+            'sizes': sizes or self.SIZES,
+            'pattern': self.PATTERN if pattern is None else pattern,
+            'size_index': size_index,
+            'start': start,
+        }).get_json()
+
+    def test_full_trace_first_needle(self):
+        data = self.track(0, 1)
+        self.assertTrue(data['ok'])
+        self.assertIsNone(data['error'])
+        # 空行不计入轨迹，原文行号保留（1,2,4,5,6）
+        self.assertEqual([r['line'] for r in data['rows']], [1, 2, 4, 5, 6])
+        first = data['rows'][0]
+        self.assertEqual(first['stitch'], 'k2tog')
+        self.assertEqual(first['pos_in'], 1)
+        self.assertEqual((first['in_from'], first['in_to']), (1, 2))
+        self.assertEqual((first['merge_with'], first['merge_side']),
+                         (2, 'right'))
+        self.assertEqual(first['pos_out'], 1)
+        self.assertEqual(first['total'], 12)
+        # 第 1 针一路并到最后，最终是第 1 枚（剩 3 针）
+        self.assertEqual(data['final_pos'], 1)
+        self.assertEqual(data['final'], 3)
+        for row in data['rows']:
+            self.assertEqual(row['pos_out'], 1)
+
+    def test_trace_needle_11_shrinks_through_k2tog_rows(self):
+        data = self.track(0, 11)
+        self.assertTrue(data['ok'])
+        rows = data['rows']
+        # 行1：第 11、12 针合成第 11 枚
+        self.assertEqual((rows[0]['stitch'], rows[0]['seq'],
+                          rows[0]['in_from'], rows[0]['in_to'],
+                          rows[0]['merge_with'], rows[0]['merge_side'],
+                          rows[0]['pos_out']),
+                         ('k2tog', 11, 11, 12, 12, 'right', 11))
+        # 行2：p 原样保留
+        self.assertEqual((rows[1]['stitch'], rows[1]['pos_in'],
+                          rows[1]['pos_out']), ('p', 11, 11))
+        # 行4（原文行号4）：k2tog 第6个操作，入针 11-12，产出 6
+        self.assertEqual(rows[2]['line'], 4)
+        self.assertEqual((rows[2]['seq'], rows[2]['in_from'],
+                          rows[2]['in_to'], rows[2]['pos_out']),
+                         (6, 11, 12, 6))
+        # 行5：入针 5-6 合成产出 3
+        self.assertEqual((rows[3]['pos_in'], rows[3]['in_from'],
+                          rows[3]['in_to'], rows[3]['pos_out']),
+                         (6, 5, 6, 3))
+        # 行6：k 第3枚
+        self.assertEqual((rows[4]['stitch'], rows[4]['pos_in'],
+                          rows[4]['pos_out']), ('k', 3, 3))
+        self.assertEqual(data['final_pos'], 3)
+
+    def test_trace_resolves_size_specific_multipliers(self):
+        # L 尺码起第 17 针：行1 入针 17-18 -> 产出17；行4 入针 17-18 -> 产出9
+        data = self.track(2, 17)
+        self.assertTrue(data['ok'])
+        self.assertEqual(data['size'], 'L')
+        self.assertEqual(data['cast_on'], 20)
+        self.assertEqual((data['rows'][0]['in_from'], data['rows'][0]['in_to'],
+                          data['rows'][0]['total']), (17, 18, 20))
+        self.assertEqual(data['rows'][2]['line'], 4)
+        self.assertEqual(data['rows'][2]['total'], 10)
+        self.assertEqual((data['rows'][2]['seq'], data['rows'][2]['pos_out']),
+                         (9, 9))
+        self.assertEqual(data['final_pos'], 5)
+        self.assertEqual(data['final'], 5)
+
+    def test_start_beyond_cast_on_is_clear_error(self):
+        data = self.track(0, 13)
+        self.assertFalse(data['ok'])
+        self.assertEqual(data['error']['type'], 'start')
+        self.assertEqual(data['error']['cast_on'], 12)
+        self.assertIn('1~12', data['error']['message'])
+        self.assertEqual(data['rows'], [])
+
+    def test_bad_start_and_size_index(self):
+        for bad in [0, -3, '1', 1.5, True, None]:
+            data = self.track(0, bad)
+            self.assertFalse(data['ok'], msg=repr(bad))
+            self.assertEqual(data['error']['type'], 'start', msg=repr(bad))
+        for bad in [-1, 3, '0', True, None]:
+            data = self.client.post('/api/track-needle', json={
+                'sizes': self.SIZES, 'pattern': 'k*4',
+                'size_index': bad, 'start': 1,
+            }).get_json()
+            self.assertFalse(data['ok'], msg=repr(bad))
+            self.assertEqual(data['error']['type'], 'size_index',
+                             msg=repr(bad))
+
+    def test_bad_sizes_rejected(self):
+        for bad in [None, [], [{'name': '', 'cast_on': 4}],
+                    [{'name': 'S', 'cast_on': 0}],
+                    [{'name': 'S', 'cast_on': 'x'}]]:
+            data = self.client.post('/api/track-needle', json={
+                'sizes': bad, 'pattern': 'k*4',
+                'size_index': 0, 'start': 1,
+            }).get_json()
+            self.assertFalse(data['ok'], msg=repr(bad))
+            self.assertEqual(data['error']['type'], 'sizes', msg=repr(bad))
+
+    def test_count_mismatch_stops_at_first_error_row_keeps_trace(self):
+        # 起针 12，行1 消耗 12（有效），行2 k2tog*5 只消耗 10：
+        # 追踪第 11 枚在第 2 行消失，轨迹保留行1
+        sizes = [{'name': 'S', 'cast_on': 12}]
+        data = self.track(0, 11, sizes=sizes, pattern='p*12\nk2tog*5\nk*2')
+        self.assertFalse(data['ok'])
+        self.assertEqual(len(data['rows']), 1)
+        self.assertEqual(data['rows'][0]['line'], 1)
+        self.assertEqual(data['rows'][0]['pos_in'], 11)
+        err = data['error']
+        self.assertEqual(err['type'], 'count')
+        self.assertEqual(err['line'], 2)
+        self.assertEqual(err['consume'], 10)
+        self.assertEqual(err['available'], 12)
+        self.assertEqual(err['diff'], -2)
+
+    def test_parse_error_stops_and_keeps_previous_trace(self):
+        # 第 4 行（原文行号）非法：保留此前两行轨迹，错误带行号与字符位置
+        data = self.track(0, 3, pattern='\n'.join([
+            '(k2tog yo)*{6|8|10}',
+            'p*{12|16|20}',
+            '',
+            'ssk bad',
+            'k*1',
+        ]))
+        self.assertFalse(data['ok'])
+        self.assertEqual([r['line'] for r in data['rows']], [1, 2])
+        err = data['error']
+        self.assertEqual(err['type'], 'parse')
+        self.assertEqual(err['line'], 4)
+        self.assertEqual(err['char'], 1)
+        self.assertNotIn('final_pos', data)
+
+    def test_parse_error_consistent_with_validate_sizes(self):
+        pattern = '(k2tog yo)*{6|8|10}\n(k yo\nk*1'
+        track_data = self.track(0, 1, pattern=pattern)
+        validate_data = self.client.post('/api/validate-sizes', json={
+            'sizes': self.SIZES, 'pattern': pattern,
+        }).get_json()
+        verr = validate_data['sizes'][0]['error']
+        terr = track_data['error']
+        self.assertEqual(terr['type'], 'parse')
+        self.assertEqual(terr['message'], verr['message'])
+        self.assertEqual(terr['char'], verr['char'])
+        self.assertEqual(terr['line'], verr['line'])
+        self.assertEqual(len(track_data['rows']), 1)
+
+    def test_blank_lines_keep_original_line_numbers(self):
+        data = self.track(0, 1, pattern='k*{12|16|20}\n\np*{12|16|20}')
+        self.assertTrue(data['ok'])
+        self.assertEqual([r['line'] for r in data['rows']], [1, 3])
+
+    def test_nested_size_repeats_trace_without_expansion(self):
+        # 嵌套按尺码重复：S 每组 (k2tog yo)*2+k 消耗5产出5，*3 -> 消耗15；
+        # M 每组消耗7，*2 -> 消耗14。追踪 S 的末针
+        sizes = [{'name': 'S', 'cast_on': 15},
+                 {'name': 'M', 'cast_on': 14}]
+        pattern = '((k2tog yo)*{2|3} k)*{3|2}'
+        data = self.track(0, 15, sizes=sizes, pattern=pattern)
+        self.assertTrue(data['ok'])
+        row = data['rows'][0]
+        self.assertEqual(row['total'], 15)
+        self.assertEqual(row['consume'], 15)
+        self.assertEqual(row['produce'], 15)
+
+    def test_huge_repeat_trace_is_immediate(self):
+        # 十亿次重复中追踪一枚针，不能展开
+        sizes = [{'name': 'S', 'cast_on': 1000000000}]
+        data = self.track(0, 1000000000, sizes=sizes,
+                          pattern='(k yo)*1000000000')
+        self.assertTrue(data['ok'])
+        row = data['rows'][0]
+        self.assertEqual((row['stitch'], row['seq'], row['pos_out']),
+                         ('k', 1999999999, 1999999999))
+        self.assertEqual(row['merge_with'], None)
+
+    def test_yo_only_rows_shift_later_positions(self):
+        # 行1 yo*3：不消耗任何入针，追踪针不在该行出现；行2 k*4 才消耗
+        # 但行1消耗0与起针4不符 -> 校验规则下在行1即停（count 错误）
+        sizes = [{'name': 'S', 'cast_on': 4}]
+        data = self.track(0, 2, sizes=sizes, pattern='(yo)*3\nk*4')
+        self.assertFalse(data['ok'])
+        self.assertEqual(data['rows'], [])
+        self.assertEqual(data['error']['line'], 1)
+        self.assertEqual(data['error']['type'], 'count')
+
+    def test_yo_inside_row_does_not_appear_as_hit(self):
+        # k yo k2tog：消耗 3 产出 3；yo 是第 2 个操作（不消耗入针但占产出位
+        # 第 2 枚），行尾 k2tog 是第 3 个操作，把入针 2-3 合成产出第 3 枚，
+        # 下一行 p*3 按第 3 枚继续——yo 只影响后续位置，自身不作为命中行出现
+        sizes = [{'name': 'S', 'cast_on': 3}]
+        data = self.track(0, 2, sizes=sizes, pattern='k yo k2tog\np*3')
+        self.assertTrue(data['ok'])
+        self.assertEqual(data['rows'][0]['stitch'], 'k2tog')
+        self.assertEqual(data['rows'][0]['seq'], 3)
+        self.assertEqual(data['rows'][0]['total'], 3)
+        # 入针 2-3 合并，产出第 3 枚，下一行按第 3 枚继续
+        self.assertEqual((data['rows'][0]['in_from'], data['rows'][0]['in_to']),
+                         (2, 3))
+        self.assertEqual(data['rows'][0]['pos_out'], 3)
+        self.assertEqual(data['rows'][1]['pos_in'], 3)
+
+
 if __name__ == '__main__':
     unittest.main()
